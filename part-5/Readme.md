@@ -111,5 +111,213 @@ Contributions are welcome! Please feel free to submit a pull request.
 This project is licensed under the MIT License.
 
 ---
+TP Vault Database Secrets Engine + MySQL + Docker (Rotation Dynamique)
+Objectif
+
+Déployer une base MySQL dans Docker
+
+Activer le Database Secret Engine dans Vault
+
+Créer des credentials dynamiques pour l’application
+
+Gérer la rotation automatique des secrets
+
+1️⃣ Prérequis
+
+Docker & Docker Compose
+
+Vault installé (binaire ou Docker)
+
+MySQL client (mysql) optionnel pour tests
+
+2️⃣ Structure du projet
+vault-mysql-dynamic/
+├─ docker-compose.yml
+├─ setup_vault_mysql_dynamic.sh
+├─ app/
+│   ├─ Dockerfile
+│   ├─ requirements.txt
+│   └─ main.py
+
+3️⃣ docker-compose.yml
+version: "3.9"
+
+services:
+  vault:
+    image: hashicorp/vault:1.16.2
+    container_name: vault
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: root
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    ports:
+      - "8200:8200"
+    cap_add:
+      - IPC_LOCK
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: appdb
+    ports:
+      - "3306:3306"
+
+  app:
+    build: ./app
+    depends_on:
+      - vault
+      - mysql
+    environment:
+      VAULT_ADDR: "http://host.docker.internal:8200"
+      VAULT_ROLE_ID: "${VAULT_ROLE_ID}"
+      VAULT_SECRET_ID: "${VAULT_SECRET_ID}"
+
+4️⃣ setup_vault_mysql_dynamic.sh
+#!/usr/bin/env bash
+set -e
+
+# Variables
+export VAULT_ADDR=http://127.0.0.1:8200
+VAULT_ROOT_TOKEN="root"
+DB_ROLE_NAME="app-role"
+
+# Lancer les conteneurs
+docker compose up -d
+
+echo "⏳ Attente 10s pour que Vault et MySQL soient prêts..."
+sleep 10
+
+# Login Vault
+export VAULT_TOKEN=$VAULT_ROOT_TOKEN
+vault login $VAULT_TOKEN >/dev/null
+
+# Activer Database Secret Engine
+vault secrets enable database || true
+
+# Config MySQL
+vault write database/config/mysql \
+    plugin_name=mysql-database-plugin \
+    connection_url="{{username}}:{{password}}@tcp(mysql:3306)/" \
+    allowed_roles="${DB_ROLE_NAME}" \
+    username="root" \
+    password="rootpass"
+
+# Créer rôle pour rotation automatique
+vault write database/roles/${DB_ROLE_NAME} \
+    db_name=mysql \
+    creation_statements="
+      CREATE USER '{{name}}'@'%' IDENTIFIED BY '{{password}}';
+      GRANT SELECT, INSERT, UPDATE, DELETE ON appdb.* TO '{{name}}'@'%';
+    " \
+    default_ttl="1m" \
+    max_ttl="5m"
+
+# Activer AppRole
+vault auth enable approle || true
+
+# Créer AppRole
+vault write auth/approle/role/python-app token_policies=default token_ttl=1h token_max_ttl=4h
+
+# Récupérer ROLE_ID et SECRET_ID
+ROLE_ID=$(vault read -field=role_id auth/approle/role/python-app/role-id)
+SECRET_ID=$(vault write -field=secret_id -f auth/approle/role/python-app/secret-id)
+
+export VAULT_ROLE_ID=$ROLE_ID
+export VAULT_SECRET_ID=$SECRET_ID
+
+echo ""
+echo "✅ Vault et MySQL prêts"
+echo "ROLE_ID=$VAULT_ROLE_ID"
+echo "SECRET_ID=$VAULT_SECRET_ID"
+
+# Lancer l'application Python
+docker compose up --build app
+
+5️⃣ Application Python
+app/Dockerfile
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY main.py .
+
+CMD ["python", "main.py"]
+
+app/requirements.txt
+hvac==2.3.0
+mysql-connector-python==9.0.0
+
+app/main.py
+import os
+import hvac
+import mysql.connector
+
+vault_addr = os.environ.get("VAULT_ADDR")
+role_id = os.environ.get("VAULT_ROLE_ID")
+secret_id = os.environ.get("VAULT_SECRET_ID")
+
+client = hvac.Client(url=vault_addr)
+
+# Authentification AppRole
+client.auth.approle.login(role_id=role_id, secret_id=secret_id)
+
+# Générer des credentials dynamiques MySQL
+creds = client.secrets.database.generate_credentials(name="app-role")
+username = creds['data']['username']
+password = creds['data']['password']
+
+print("✅ Credentials dynamiques générés :")
+print(f"User: {username}, Password: {password}")
+
+# Tester connexion MySQL
+conn = mysql.connector.connect(
+    host="mysql",
+    user=username,
+    password=password,
+    database="appdb"
+)
+print("✅ Connexion MySQL réussie !")
+conn.close()
+
+6️⃣ Exécution du TP
+
+Rendre le script exécutable :
+
+chmod +x setup_vault_mysql_dynamic.sh
+
+
+Lancer tout le TP :
+
+./setup_vault_mysql_dynamic.sh
+
+
+Vérifier que la rotation fonctionne :
+
+vault read database/creds/app-role
+# Attendre 1 min et relire
+vault read database/creds/app-role
+
+
+Chaque lecture crée un nouvel utilisateur temporaire MySQL
+
+L’ancien utilisateur est révoqué automatiquement
+
+7️⃣ Résumé du flux
+Vault Database Secret Engine
+        │
+        ├─> Génération dynamique d'un user MySQL
+        │
+        ├─> TTL court (1 à 5 min)
+        │
+        ├─> Révocation automatique à l'expiration
+        │
+        └─> Application récupère credentials via AppRole
+
+
+✅ Ce setup est idempotent, sécurisé et prêt pour test ou apprentissage.
 
 By following these steps, you’ll learn to create and manage secure, temporary AWS credentials using HashiCorp Vault. Stay tuned for more tutorials on cloud security and dynamic secrets! 
